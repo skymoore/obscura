@@ -145,7 +145,8 @@ impl BrowserState {
         self.tabs.remove(tab_id).is_some()
     }
 
-    fn has_active_page_runtime(&self) -> bool {
+    /// Whether the active tab has a live JS runtime with work worth pumping.
+    pub fn has_active_page_runtime(&self) -> bool {
         self.active_tab
             .as_ref()
             .and_then(|tab_id| self.tabs.get(tab_id))
@@ -156,7 +157,9 @@ impl BrowserState {
     /// consume any navigation that task queued. MCP owns its pages continuously,
     /// so leaving either half for the next tool call strands timers, fetches,
     /// and location/form/click navigations while the transport waits on stdin.
-    async fn advance_active_page_tasks(&mut self) -> Result<bool, String> {
+    ///
+    /// Public so in-process embedders can run the same pump loop as `run()`.
+    pub async fn advance_active_page_tasks(&mut self) -> Result<bool, String> {
         let page = self.page_mut();
         let reached_idle = page.run_autonomous_event_loop_turn().await?;
         let navigated = page
@@ -312,6 +315,12 @@ fn handle_initialize(id: Value, params: &Value) -> RpcResponse {
 }
 
 fn handle_tools_list(id: Value) -> RpcResponse {
+    RpcResponse::ok(id, json!({ "tools": tools() }))
+}
+
+/// The MCP `tools/list` array, for embedders that dispatch in-process via
+/// [`call_tool`] instead of speaking JSON-RPC over stdio through [`run`].
+pub fn tools() -> Vec<Value> {
     #[allow(unused_mut)]
     let mut tools = json!([
             {
@@ -726,7 +735,7 @@ fn handle_tools_list(id: Value) -> RpcResponse {
         ]);
     }
 
-    RpcResponse::ok(id, json!({ "tools": tools }))
+    tools
 }
 
 async fn handle_tool_call(id: Value, params: &Value, state: &mut BrowserState) -> RpcResponse {
@@ -736,6 +745,20 @@ async fn handle_tool_call(id: Value, params: &Value, state: &mut BrowserState) -
     };
     let args = params.get("arguments").unwrap_or(&Value::Null);
 
+    match call_tool(state, name, args).await {
+        Ok(result) => RpcResponse::ok(id, result),
+        Err(e) => RpcResponse::ok(id, json!({
+            "content": [{ "type": "text", "text": format!("Error: {e}") }],
+            "isError": true
+        })),
+    }
+}
+
+/// Dispatch one tool call in-process and return the MCP `tools/call` result
+/// object: `{ "content": [ {type:"text",text} | {type:"image",data,mimeType} ],
+/// "isError": bool }`. Tool failures are reported inside that object with
+/// `isError: true`; `Err` is reserved for an unknown tool name.
+pub async fn call_tool(state: &mut BrowserState, name: &str, args: &Value) -> Result<Value, String> {
     #[cfg(feature = "render")]
     {
         let media_result = match name {
@@ -744,13 +767,13 @@ async fn handle_tool_call(id: Value, params: &Value, state: &mut BrowserState) -
             _ => None,
         };
         if let Some(result) = media_result {
-            return match result {
-                Ok(content) => RpcResponse::ok(id, json!({ "content": [content] })),
-                Err(error) => RpcResponse::ok(id, json!({
+            return Ok(match result {
+                Ok(content) => json!({ "content": [content] }),
+                Err(error) => json!({
                     "content": [{ "type": "text", "text": format!("Error: {error}") }],
                     "isError": true
-                })),
-            };
+                }),
+            });
         }
     }
 
@@ -792,18 +815,18 @@ async fn handle_tool_call(id: Value, params: &Value, state: &mut BrowserState) -
         "browser_search" => tool_search(args, state),
         "browser_storage_state" => tool_storage_state(state),
         "browser_set_storage_state" => tool_set_storage_state(args, state),
-        _ => Err(format!("Unknown tool: {name}")),
+        _ => return Err(format!("Unknown tool: {name}")),
     };
 
-    match result {
-        Ok(content) => RpcResponse::ok(id, json!({
+    Ok(match result {
+        Ok(content) => json!({
             "content": [{ "type": "text", "text": content }]
-        })),
-        Err(e) => RpcResponse::ok(id, json!({
+        }),
+        Err(e) => json!({
             "content": [{ "type": "text", "text": format!("Error: {e}") }],
             "isError": true
-        })),
-    }
+        }),
+    })
 }
 
 #[cfg(feature = "render")]
