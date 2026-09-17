@@ -132,12 +132,18 @@ impl BrowserState {
         id
     }
 
-    /// Record every response `page` receives into `captured`, evicting the
-    /// oldest entries past `capture_entries`.
+    /// Record every data-bearing response `page` receives into `captured`
+    /// (documents and JS `fetch()`/XHR — scripts, styles, images and fonts
+    /// are never API routes and would evict the navigation from a bounded
+    /// buffer), dropping the oldest entries past `capture_entries`.
     fn attach_capture(&self, page: &mut Page) {
         let captured = self.captured.clone();
         let (entries, body_bytes) = (self.capture_entries, self.capture_body_bytes);
         page.on_response(Arc::new(move |req, resp| {
+            use obscura_net::ResourceType as R;
+            if !matches!(req.resource_type, R::Document | R::Fetch | R::Xhr | R::Other) {
+                return;
+            }
             let mut buf = captured.lock().unwrap_or_else(PoisonError::into_inner);
             buf.push_back(exchange_json(req, resp, body_bytes));
             while buf.len() > entries {
