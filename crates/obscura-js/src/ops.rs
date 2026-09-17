@@ -4998,7 +4998,7 @@ async fn fetch_url_inner(
                 );
                 let info = RequestInfo {
                     url: resp.url.clone(), method: current_method.as_str().to_string(),
-                    headers: resp_headers.clone(), resource_type,
+                    headers: custom_headers.clone(), resource_type,
                 };
                 cbs.fire_response(&info, &resp).await;
             }
@@ -5252,7 +5252,7 @@ async fn stealth_fetch_all(
                 );
                 let info = RequestInfo {
                     url: resp.url.clone(), method: current_method.clone(),
-                    headers: resp_headers.clone(), resource_type,
+                    headers: custom_headers.clone(), resource_type,
                 };
                 cbs.fire_response(&info, &resp).await;
             }
