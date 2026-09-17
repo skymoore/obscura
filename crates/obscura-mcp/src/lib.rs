@@ -5,13 +5,15 @@
 
 pub mod http;
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 #[cfg(feature = "render")]
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_browser::{BrowserContext, Page};
+use obscura_net::{RequestInfo, Response};
 use obscura_dom::NodeId;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -77,6 +79,12 @@ pub struct BrowserState {
     /// table is wiped on every navigation / tab switch and refilled on
     /// the next snapshot call.
     interactive_refs: HashMap<String, NodeId>,
+    /// Every response any of this session's pages received, oldest first,
+    /// as Exchange JSON. Drained by `browser_network_capture`; bounded by
+    /// `capture_entries` so a chatty page cannot grow it without limit.
+    captured: Arc<Mutex<VecDeque<Value>>>,
+    capture_entries: usize,
+    capture_body_bytes: usize,
 }
 
 impl BrowserState {
@@ -89,6 +97,9 @@ impl BrowserState {
             user_agent,
             console_messages: Vec::new(),
             interactive_refs: HashMap::new(),
+            captured: Arc::default(),
+            capture_entries: env_usize("OBSCURA_NETWORK_BODY_BUFFER_ENTRIES", 128),
+            capture_body_bytes: env_usize("OBSCURA_NETWORK_BODY_BUFFER_BYTES", 2 * 1024 * 1024),
         }
     }
 
@@ -100,7 +111,9 @@ impl BrowserState {
         if self.active_tab.is_none() {
             self.tab_counter += 1;
             let id = format!("tab-{}", self.tab_counter);
-            self.tabs.insert(id.clone(), Page::new("mcp-page".to_string(), self.context.clone()));
+            let mut page = Page::new("mcp-page".to_string(), self.context.clone());
+            self.attach_capture(&mut page);
+            self.tabs.insert(id.clone(), page);
             self.active_tab = Some(id);
         }
         let id = self.active_tab.as_ref().unwrap().clone();
@@ -111,10 +124,26 @@ impl BrowserState {
     fn new_tab(&mut self) -> String {
         self.tab_counter += 1;
         let id = format!("tab-{}", self.tab_counter);
-        self.tabs.insert(id.clone(), Page::new(format!("mcp-{id}"), self.context.clone()));
+        let mut page = Page::new(format!("mcp-{id}"), self.context.clone());
+        self.attach_capture(&mut page);
+        self.tabs.insert(id.clone(), page);
         self.active_tab = Some(id.clone());
         self.interactive_refs.clear();
         id
+    }
+
+    /// Record every response `page` receives into `captured`, evicting the
+    /// oldest entries past `capture_entries`.
+    fn attach_capture(&self, page: &mut Page) {
+        let captured = self.captured.clone();
+        let (entries, body_bytes) = (self.capture_entries, self.capture_body_bytes);
+        page.on_response(Arc::new(move |req, resp| {
+            let mut buf = captured.lock().unwrap_or_else(PoisonError::into_inner);
+            buf.push_back(exchange_json(req, resp, body_bytes));
+            while buf.len() > entries {
+                buf.pop_front();
+            }
+        }));
     }
 
     /// Enforce the single-live-isolate invariant. rusty_v8 enters each V8
@@ -221,6 +250,57 @@ impl BrowserState {
         }
         Ok(format!("[data-obscura-ref=\"{r}\"]"))
     }
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// Content types whose bodies are worth handing to an agent as text.
+fn is_textual(ct: &str) -> bool {
+    ct.starts_with("text/")
+        || ct == "application/json"
+        || ct.ends_with("+json")
+        || ct == "application/xml"
+        || ct.ends_with("+xml")
+        || ct == "application/javascript"
+        || ct == "application/x-javascript"
+}
+
+/// One request/response pair as the Exchange JSON `browser_network_capture`
+/// returns. Header names are lowercased; the body is included only for
+/// textual content types and cut at `body_bytes`.
+fn exchange_json(req: &RequestInfo, resp: &Response, body_bytes: usize) -> Value {
+    let lower = |headers: &HashMap<String, String>| -> serde_json::Map<String, Value> {
+        headers.iter().map(|(k, v)| (k.to_ascii_lowercase(), Value::String(v.clone()))).collect()
+    };
+    let content_type = resp
+        .content_type()
+        .map(|ct| ct.split_once(';').map_or(ct, |(mime, _)| mime).trim().to_ascii_lowercase());
+    let mut truncated = false;
+    let body = content_type.as_deref().filter(|ct| is_textual(ct)).map(|_| {
+        let mut text = resp.text();
+        if text.len() > body_bytes {
+            let cut = (0..=body_bytes).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
+            text.truncate(cut);
+            truncated = true;
+        }
+        text
+    });
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+    json!({
+        "url": resp.url.as_str(),
+        "method": req.method.to_ascii_uppercase(),
+        "resource_type": format!("{:?}", req.resource_type),
+        "status": resp.status,
+        "request_headers": lower(&req.headers),
+        "response_headers": lower(&resp.headers),
+        "content_type": content_type,
+        "body": body,
+        "body_len": resp.body.len(),
+        "truncated": truncated,
+        "ts": ts,
+    })
 }
 
 pub(crate) async fn dispatch(method: &str, id: Value, params: &Value, state: &mut BrowserState) -> RpcResponse {
@@ -440,6 +520,16 @@ pub fn tools() -> Vec<Value> {
                 "inputSchema": {
                     "type": "object",
                     "properties": {}
+                }
+            },
+            {
+                "name": "browser_network_capture",
+                "description": "Every request/response the current session's pages made, with request headers and textual bodies, as a JSON array. Cleared after each read unless clear=false.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "clear": { "type": "boolean", "description": "Empty the buffer after reading (default true)" }
+                    }
                 }
             },
             {
@@ -788,6 +878,7 @@ pub async fn call_tool(state: &mut BrowserState, name: &str, args: &Value) -> Re
         "browser_evaluate" => tool_evaluate(args, state).await,
         "browser_wait_for" => tool_wait_for(args, state).await,
         "browser_network_requests" => tool_network_requests(state),
+        "browser_network_capture" => tool_network_capture(args, state),
         "browser_console_messages" => tool_console_messages(state),
         "browser_close" => tool_close(state),
         // Tier 1 agent-UX additions
@@ -1198,6 +1289,19 @@ fn tool_network_requests(state: &mut BrowserState) -> Result<String, String> {
     }).collect();
 
     Ok(lines.join("\n"))
+}
+
+/// Compact JSON array of Exchange objects (bodies are large; no pretty
+/// printing). Drains the buffer unless `clear: false`.
+fn tool_network_capture(args: &Value, state: &BrowserState) -> Result<String, String> {
+    let clear = args.get("clear").and_then(Value::as_bool).unwrap_or(true);
+    let mut buf = state.captured.lock().unwrap_or_else(PoisonError::into_inner);
+    let json = if clear {
+        serde_json::to_string(&std::mem::take(&mut *buf))
+    } else {
+        serde_json::to_string(&*buf)
+    };
+    json.map_err(|e| e.to_string())
 }
 
 fn tool_console_messages(state: &BrowserState) -> Result<String, String> {
@@ -2273,6 +2377,76 @@ mod tests {
             submitted.contains("q=hello"),
             "the submitted body must carry the filled field, got {submitted}"
         );
+    }
+
+    /// Serves `/` as HTML that fires an authenticated `fetch('/api')` and
+    /// `/api` as JSON.
+    fn spawn_capture_server() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut buf = [0u8; 8192];
+                let read = stream.read(&mut buf).unwrap_or(0);
+                let raw = String::from_utf8_lossy(&buf[..read]);
+                let path = raw.split_whitespace().nth(1).unwrap_or("/");
+                let (ct, body) = if path.starts_with("/api") {
+                    ("application/json; charset=utf-8", r#"{"items":[{"a":1},{"a":2}]}"#)
+                } else {
+                    ("text/html", "<script>fetch('/api',{headers:{'x-token':'abc'}})</script>")
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        base
+    }
+
+    async fn capture(state: &mut BrowserState, args: Value) -> Vec<Value> {
+        let out = call_tool(state, "browser_network_capture", &args).await.expect("capture");
+        let text = out["content"][0]["text"].as_str().expect("text content");
+        serde_json::from_str(text).expect("capture must be a JSON array")
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn network_capture_reports_request_headers_and_bodies_then_drains() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let base = spawn_capture_server();
+        let mut state = BrowserState::new(None, None, false);
+        call_tool(&mut state, "browser_navigate", &json!({ "url": base }))
+            .await
+            .expect("navigate");
+
+        let is_api = |e: &Value| e["url"].as_str().is_some_and(|u| u.ends_with("/api"));
+        let mut exchanges = Vec::new();
+        for _ in 0..50 {
+            exchanges = capture(&mut state, json!({ "clear": false })).await;
+            if exchanges.iter().any(is_api) {
+                break;
+            }
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                state.advance_active_page_tasks(),
+            )
+            .await;
+        }
+        let api = exchanges.iter().find(|e| is_api(e)).expect("fetch('/api') must be captured");
+        assert_eq!(api["method"], "GET");
+        assert_eq!(api["status"], 200);
+        assert_eq!(api["request_headers"]["x-token"], "abc");
+        assert_eq!(api["content_type"], "application/json");
+        assert_eq!(api["truncated"], false);
+        assert!(api["body"].as_str().is_some_and(|b| b.contains("\"items\"")), "body: {}", api["body"]);
+        assert!(exchanges.iter().any(|e| e["resource_type"] == "Document"), "navigation must be captured too");
+
+        // Default clear=true drains; the next read is empty.
+        assert!(!capture(&mut state, json!({})).await.is_empty());
+        assert!(capture(&mut state, json!({})).await.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
