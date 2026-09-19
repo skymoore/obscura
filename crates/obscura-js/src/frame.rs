@@ -914,6 +914,39 @@ mod tests {
         );
     }
 
+    /// deno_core's isolate-wide `promise_reject_callback` reads `ContextState`
+    /// out of the *current* context's embedder slot. Before the child realm
+    /// mirrored the main realm's slots, an unhandled rejection in a frame was
+    /// `Rc::increment_strong_count(null)`: a SIGSEGV that took the whole host
+    /// process with it (wth 2026-09-18, porkbun checkout with Stripe frames).
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unhandled_rejection_in_a_frame_does_not_kill_the_process() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+        frame
+            .execute_script(
+                &mut parent,
+                "Promise.reject(new Error('boom')); \
+                 Promise.resolve().then(() => { \
+                   document.body.setAttribute('data-alive', '1'); });",
+            )
+            .unwrap();
+        parent.run_event_loop_bounded(300).await.unwrap();
+        assert_eq!(
+            frame
+                .evaluate(&mut parent, "document.body.getAttribute('data-alive')")
+                .unwrap(),
+            serde_json::json!("1"),
+        );
+    }
+
     /// A frame posting to `parent` must reach the page, arrive trusted, and
     /// carry the frame's origin. Turnstile and every widget like it drop an
     /// untrusted message silently, so an untrusted delivery is not a cosmetic

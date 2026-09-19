@@ -603,9 +603,19 @@ impl ObscuraJsRuntime {
     /// only. Use [`Self::share_ops_with_realm`] to give it the same `Deno.core`
     /// object, which is legal because native function objects are shareable
     /// between contexts of one isolate.
+    ///
+    /// deno_core's isolate-wide callbacks (`promise_reject_callback`,
+    /// dynamic `import()`, `import.meta`) read their `ContextState` and
+    /// `ModuleMap` out of the *current* context's embedder-data slots, and only
+    /// its own main context has them set. A snapshot-restored context has null
+    /// there, so an unhandled rejection inside a frame was
+    /// `Rc::increment_strong_count(null)`: SIGSEGV at `-16`. The child borrows
+    /// the main realm's pointers (no refcount taken: every frame dies with the
+    /// page, before deno_core tears the main realm down).
     pub(crate) fn create_realm_context(
         &mut self,
     ) -> Option<deno_core::v8::Global<deno_core::v8::Context>> {
+        let main = self.runtime().main_context();
         let context = {
             let mut entered = self.runtime();
             let isolate = entered.v8_isolate();
@@ -622,6 +632,19 @@ impl ObscuraJsRuntime {
                     deno_core::v8::ContextOptions::default(),
                 )
             })?;
+            let main = deno_core::v8::Local::new(scope, main);
+            for slot in [
+                deno_core::CONTEXT_STATE_SLOT_INDEX,
+                deno_core::MODULE_MAP_SLOT_INDEX,
+            ] {
+                // SAFETY: the main context's slots were set by deno_core at
+                // realm creation; the child only mirrors those pointers, and
+                // never outlives the main realm.
+                unsafe {
+                    let ptr = main.get_aligned_pointer_from_embedder_data(slot);
+                    context.set_aligned_pointer_in_embedder_data(slot, ptr);
+                }
+            }
             deno_core::v8::Global::new(scope, context)
         };
         Some(context)
