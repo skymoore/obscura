@@ -161,7 +161,17 @@ fn main() {
 fn generate_host_snapshot(bootstrap_js: &str, snapshot_path: &PathBuf) {
     assert!(bootstrap_js.is_ascii(), "bootstrap source must be ASCII; use Unicode escapes in literals");
     // Compiler intrinsics are confined to this build process and an unretained hook.
-    deno_core::v8::V8::set_flags_from_string("--allow-natives-syntax");
+    //
+    // `--no-extensible-ro-snapshot`: keep this snapshot's read-only heap identical to V8's built-in
+    // snapshot's. V8 shares ONE read-only heap per process (per isolate group), deserialised from the
+    // snapshot of whichever isolate is created while none is alive, and checks later snapshots against it
+    // only in debug builds. With the flag on (V8's default) the snapshot creator extends the built-in
+    // read-only space and promotes immutable objects into it, so an obscura isolate created while an
+    // embedder's other deno_core isolate (built-in snapshot) owns the heap reads past its pages:
+    // libc++ "vector[] index out of bounds" in Deserializer::ReadReadOnlyHeapRef, process abort. Off,
+    // promotion is skipped (snapshot.cc: RO space not writable) and every isolate in the process can
+    // share the read-only heap in any order; the would-be-promoted objects live per isolate instead.
+    deno_core::v8::V8::set_flags_from_string("--allow-natives-syntax --no-extensible-ro-snapshot");
     let compiler = r#""use strict";
 Object.defineProperty(globalThis, '__obscura_snapshot_compile', {
   configurable: true,
