@@ -2470,10 +2470,14 @@ fn format_web_results(query: &str, body: &Value) -> String {
 /// for every origin the page knows about. Agents stash this between
 /// runs to skip a login flow.
 fn tool_storage_state(state: &mut BrowserState) -> Result<String, String> {
-    let cookies: Vec<Value> = state.context.cookie_jar.get_all_cookies().iter().map(|c| json!({
+    // `host_only` makes the round trip through browser_set_storage_state
+    // lossless: without it every cookie would come back domain-scoped and
+    // `__Host-` cookies would be rejected on import.
+    let cookies: Vec<Value> = state.context.cookie_jar.get_all_cookies_with_scope().iter().map(|(c, host_only)| json!({
         "name": c.name,
         "value": c.value,
         "domain": c.domain,
+        "host_only": host_only,
         "path": c.path,
         "secure": c.secure,
         "http_only": c.http_only,
@@ -2538,8 +2542,10 @@ fn tool_set_storage_state(args: &Value, state: &mut BrowserState) -> Result<Stri
         Some(value) => value.as_array().ok_or("cookies must be an array")?,
         None => &[],
     };
-    let parsed: Vec<obscura_net::CookieInfo> = cookies.iter().map(|c| {
-        Some(obscura_net::CookieInfo {
+    // `host_only` is optional: states exported before it existed load as
+    // domain-scoped cookies, as they always did.
+    let parsed: Vec<(obscura_net::CookieInfo, bool)> = cookies.iter().map(|c| {
+        Some((obscura_net::CookieInfo {
             name: c.get("name")?.as_str()?.to_string(),
             value: c.get("value")?.as_str()?.to_string(),
             domain: c.get("domain")?.as_str()?.to_string(),
@@ -2548,7 +2554,7 @@ fn tool_set_storage_state(args: &Value, state: &mut BrowserState) -> Result<Stri
             http_only: c.get("http_only").and_then(Value::as_bool).unwrap_or(false),
             same_site: c.get("same_site").and_then(Value::as_str).unwrap_or("").to_string(),
             expires: c.get("expires").and_then(Value::as_i64),
-        })
+        }, c.get("host_only").and_then(Value::as_bool).unwrap_or(false)))
     }).collect::<Option<Vec<_>>>()
         .ok_or("Each cookie requires string name, value and domain fields")?;
     let cookie_count = parsed.len();
@@ -2570,7 +2576,7 @@ fn tool_set_storage_state(args: &Value, state: &mut BrowserState) -> Result<Stri
             }
         }
     }
-    state.context.cookie_jar.set_cookies_from_cdp(parsed);
+    state.context.cookie_jar.set_cookies_from_cdp_with_scope(parsed);
     state.context.save_storage();
     Ok(format!("Restored {applied} web storage entries; processed {cookie_count} cookie entries."))
 }
@@ -2912,6 +2918,55 @@ mod tests {
         restored.page_mut().navigate(&origin).await.expect("restored page");
         assert_eq!(restored.page_mut().evaluate(r#"[localStorage.getItem('\0key'), sessionStorage.getItem('\0tab')]"#),
             json!(["\0\"value\"", "\0session"]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn storage_state_round_trip_keeps_host_only_and_host_prefix_cookies() {
+        let mut state = BrowserState::new(None, None, false);
+        let host = url::Url::parse("https://app.example.com/").unwrap();
+        let jar = &state.context.cookie_jar;
+        jar.set_cookie("__Host-sid=s1; Secure; HttpOnly; Path=/; SameSite=Lax", &host);
+        jar.set_cookie("plain=p1; Path=/; SameSite=Strict; Max-Age=3600", &host);
+        jar.set_cookie("wide=w1; Domain=example.com; Path=/; Secure", &host);
+        let exported: Value = serde_json::from_str(&tool_storage_state(&mut state).expect("export")).unwrap();
+        let by_name = |name: &str| exported["cookies"].as_array().unwrap().iter()
+            .find(|c| c["name"] == name).unwrap_or_else(|| panic!("{name} missing: {exported}")).clone();
+        assert_eq!(by_name("__Host-sid")["host_only"], json!(true));
+        assert_eq!(by_name("plain")["host_only"], json!(true));
+        assert_eq!(by_name("wide")["host_only"], json!(false));
+        drop(state);
+
+        let mut restored = BrowserState::new(None, None, false);
+        tool_set_storage_state(&json!({"state": exported.clone()}), &mut restored).expect("restore");
+        let mut again: Value = serde_json::from_str(&tool_storage_state(&mut restored).expect("re-export")).unwrap();
+        let mut first = exported.clone();
+        for value in [&mut first, &mut again] {
+            value["cookies"].as_array_mut().unwrap().sort_by_key(|c| c["name"].as_str().unwrap().to_string());
+        }
+        assert_eq!(first["cookies"], again["cookies"], "every cookie attribute must survive the round trip");
+
+        let jar = &restored.context.cookie_jar;
+        let exact = jar.get_cookie_header_same_site(&host);
+        assert!(exact.contains("__Host-sid=s1") && exact.contains("plain=p1") && exact.contains("wide=w1"), "{exact}");
+        let sub = url::Url::parse("https://x.app.example.com/").unwrap();
+        assert_eq!(jar.get_cookie_header_same_site(&sub), "wide=w1", "host-only cookies must stay on the exact host");
+        let sibling = url::Url::parse("https://www.example.com/").unwrap();
+        assert_eq!(jar.get_cookie_header_same_site(&sibling), "wide=w1");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn storage_state_without_host_only_loads_as_domain_cookies() {
+        let mut state = BrowserState::new(None, None, false);
+        tool_set_storage_state(&json!({"state": {"cookies": [
+            {"name": "sid", "value": "v", "domain": "example.com", "path": "/", "secure": true,
+             "http_only": true, "same_site": "Lax", "expires": null},
+            {"name": "__Host-old", "value": "v", "domain": "example.com", "path": "/", "secure": true}
+        ]}}), &mut state).expect("old-format state");
+        let jar = &state.context.cookie_jar;
+        for url in ["https://example.com/", "https://www.example.com/"] {
+            assert_eq!(jar.get_cookie_header_same_site(&url::Url::parse(url).unwrap()), "sid=v",
+                "an old state stays domain-scoped and still drops a domain-scoped __Host- cookie ({url})");
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
