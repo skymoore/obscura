@@ -255,6 +255,14 @@ impl CookieJar {
     }
 
     pub fn get_all_cookies(&self) -> Vec<CookieInfo> {
+        self.get_all_cookies_with_scope().into_iter().map(|(cookie, _)| cookie).collect()
+    }
+
+    /// Export every unexpired cookie together with its host-only flag, the
+    /// counterpart of `set_cookies_from_cdp_with_scope`: feeding the result
+    /// back reproduces the jar, including `__Host-` cookies, which a
+    /// domain-scoped import would reject.
+    pub fn get_all_cookies_with_scope(&self) -> Vec<(CookieInfo, bool)> {
         let cookies = self.read_jar();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -266,16 +274,19 @@ impl CookieJar {
                 if entry.expires.is_some_and(|expires| expires <= now) {
                     continue;
                 }
-                result.push(CookieInfo {
-                    name: entry.name.clone(),
-                    value: entry.value.clone(),
-                    domain: entry.domain.clone(),
-                    path: entry.path.clone(),
-                    secure: entry.secure,
-                    http_only: entry.http_only,
-                    same_site: entry.same_site.clone(),
-                    expires: entry.expires.map(|e| e as i64),
-                });
+                result.push((
+                    CookieInfo {
+                        name: entry.name.clone(),
+                        value: entry.value.clone(),
+                        domain: entry.domain.clone(),
+                        path: entry.path.clone(),
+                        secure: entry.secure,
+                        http_only: entry.http_only,
+                        same_site: entry.same_site.clone(),
+                        expires: entry.expires.map(|e| e as i64),
+                    },
+                    entry.host_only,
+                ));
             }
         }
         result
@@ -1866,6 +1877,39 @@ mod tests {
         assert!(loaded
             .get_cookie_header_same_site(&Url::parse("https://sub.www.example.com/").unwrap())
             .is_empty());
+    }
+
+    #[test]
+    fn scoped_export_round_trips_every_attribute_into_a_fresh_jar() {
+        let jar = CookieJar::new();
+        let host = Url::parse("https://app.example.com/").unwrap();
+        jar.set_cookie("__Host-sid=s1; Secure; HttpOnly; Path=/; SameSite=Lax", &host);
+        jar.set_cookie("plain=p1; Path=/; SameSite=Strict; Max-Age=3600", &host);
+        jar.set_cookie("wide=w1; Domain=example.com; Path=/app; Secure; SameSite=None", &host);
+
+        let fresh = CookieJar::new();
+        fresh.set_cookies_from_cdp_with_scope(jar.get_all_cookies_with_scope());
+
+        let key = |(c, host_only): &(CookieInfo, bool)| {
+            format!(
+                "{}={} {} {} {} {:?} {} {} {}",
+                c.name, c.value, c.domain, host_only, c.path, c.expires, c.secure, c.http_only, c.same_site
+            )
+        };
+        let mut before: Vec<_> = jar.get_all_cookies_with_scope().iter().map(key).collect();
+        let mut after: Vec<_> = fresh.get_all_cookies_with_scope().iter().map(key).collect();
+        before.sort();
+        after.sort();
+        assert_eq!(before.len(), 3, "{before:?}");
+        assert_eq!(before, after);
+
+        let exact = fresh.get_cookie_header_same_site(&host);
+        assert!(exact.contains("__Host-sid=s1"), "{exact}");
+        assert!(exact.contains("plain=p1"), "{exact}");
+        let sub = fresh.get_cookie_header_same_site(&Url::parse("https://x.app.example.com/app").unwrap());
+        assert_eq!(sub, "wide=w1", "host-only cookies must not reach a subdomain");
+        let sibling = fresh.get_cookie_header_same_site(&Url::parse("https://www.example.com/app/x").unwrap());
+        assert_eq!(sibling, "wide=w1");
     }
 
     #[test]
